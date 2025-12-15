@@ -4,7 +4,7 @@ import time
 import logging
 import threading
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from flask import Flask, jsonify, render_template_string, request
 
@@ -34,18 +34,46 @@ logger = logging.getLogger("sensutv")
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # obligatorio
 PORT = int(os.getenv("PORT", "10000"))
-BOT_PAY_LINK = os.getenv("BOT_PAY_LINK", "").strip()  # opcional (link t.me/tuBot?start=join)
+BOT_PAY_LINK = os.getenv("BOT_PAY_LINK", "").strip()  # opcional
 
 # Persistencia (Render Disk recomendado: /var/data)
-DATA_DIR = os.getenv("DATA_DIR", "/var/data")
-os.makedirs(DATA_DIR, exist_ok=True)
+# Si NO se puede escribir, caeremos a /tmp/data automáticamente.
+DATA_DIR_PREFERRED = os.getenv("DATA_DIR", "/var/data")
+
+
+def choose_data_dir(preferred: str) -> str:
+    """
+    Intenta usar preferred (idealmente /var/data con Render Disk).
+    Si falla por permisos o por cualquier motivo, usa /tmp/data (siempre escribible).
+    """
+    preferred = preferred.strip() or "/var/data"
+    fallback = "/tmp/data"
+
+    # 1) Probar preferred
+    try:
+        os.makedirs(preferred, exist_ok=True)
+        testfile = os.path.join(preferred, ".write_test")
+        with open(testfile, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(testfile)
+        logger.info("✅ DATA_DIR usable: %s", preferred)
+        return preferred
+    except Exception as e:
+        logger.warning("⚠️ No se pudo usar DATA_DIR=%s (%s). Usando fallback %s", preferred, e, fallback)
+
+    # 2) Fallback
+    os.makedirs(fallback, exist_ok=True)
+    logger.info("✅ DATA_DIR fallback activo: %s", fallback)
+    return fallback
+
+
+DATA_DIR = choose_data_dir(DATA_DIR_PREFERRED)
 
 MODELS_FILE = os.path.join(DATA_DIR, "models.json")
 UPLOADS_FILE = os.path.join(DATA_DIR, "uploads.json")
 
-# Para tu organización en Wasabi (bucket ya creado: sensutv-media)
+# Wasabi
 WASABI_BUCKET = os.getenv("WASABI_BUCKET", "sensutv-media")
-# Región informativa (no se usa para subir, solo para mostrar)
 WASABI_REGION = os.getenv("WASABI_REGION", "eu-central-2")
 
 # =========================
@@ -87,7 +115,6 @@ def save_uploads(data: Dict[str, Any]):
 
 def slugify(s: str) -> str:
     s = s.strip().lower()
-    allowed = "abcdefghijklmnopqrstuvwxyz0123456789-_"
     out = []
     for ch in s:
         if ch.isalnum():
@@ -96,7 +123,6 @@ def slugify(s: str) -> str:
             out.append("-")
         elif ch in ["_", "-"]:
             out.append(ch)
-        # otros caracteres se eliminan
     res = "".join(out)
     while "--" in res:
         res = res.replace("--", "-")
@@ -112,8 +138,7 @@ def now_yyyymmdd() -> str:
 # =========================
 app = Flask(__name__)
 
-HOME_HTML = """
-<!doctype html>
+HOME_HTML = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
@@ -149,11 +174,14 @@ HOME_HTML = """
         Link bot: <span class="mono">{{bot_pay_link}}</span>
       </div>
       {% endif %}
+      <div style="margin-top:12px" class="muted">
+        DATA_DIR activo: <span class="mono">{{data_dir}}</span>
+      </div>
     </div>
 
     <div class="card">
       <h3>Últimas subidas</h3>
-      <div class="muted">Esto se alimenta de <span class="mono">uploads.json</span> (que creamos desde el bot).</div>
+      <div class="muted">Esto se alimenta de <span class="mono">uploads.json</span> (creado desde el bot).</div>
       <div class="grid" style="margin-top:12px">
         {% for it in items %}
         <div class="card" style="margin:0">
@@ -176,9 +204,11 @@ HOME_HTML = """
 </html>
 """
 
+
 @app.get("/healthz")
 def healthz():
     return "ok", 200
+
 
 @app.get("/")
 def home():
@@ -190,26 +220,29 @@ def home():
         bot_pay_link=BOT_PAY_LINK,
         bucket=WASABI_BUCKET,
         region=WASABI_REGION,
+        data_dir=DATA_DIR,
     )
+
 
 @app.get("/api/models")
 def api_models():
     return jsonify(load_models())
 
+
 @app.get("/api/uploads")
 def api_uploads():
     return jsonify(load_uploads())
+
 
 @app.get("/feed")
 def feed():
     tier = request.args.get("tier", "free")
     data = load_uploads().get("items", [])
-    # por ahora mostramos todo, luego filtramos free/premium
     return jsonify({"tier": tier, "items": list(reversed(data))})
+
 
 @app.get("/premium")
 def premium():
-    # Aquí después conectamos Stripe o redirección a bot
     if BOT_PAY_LINK:
         return jsonify({"ok": True, "next": BOT_PAY_LINK})
     return jsonify({"ok": False, "error": "BOT_PAY_LINK not set"}), 400
@@ -223,13 +256,7 @@ def run_flask():
 # =========================
 # TELEGRAM BOT (PTB v20.x)
 # =========================
-
-# Conversation states
 S_MODEL_NAME, S_COUNTRY, S_AGE, S_TAGS, S_TYPE, S_CATEGORY = range(6)
-
-def is_admin(update: Update) -> bool:
-    # Por simplicidad: el dueño eres tú. Luego podemos restringir por user_id.
-    return True
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -240,9 +267,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /models → lista de modelos\n"
         "• /plan → te pregunto datos y te doy la *ruta exacta* para subir en Wasabi\n"
         "• /last → últimas rutas creadas\n\n"
-        "📦 Bucket Wasabi: `{}`\n"
-        "🌍 Region: `{}`\n"
-    ).format(WASABI_BUCKET, WASABI_REGION)
+        f"📦 Bucket Wasabi: `{WASABI_BUCKET}`\n"
+        f"🌍 Region: `{WASABI_REGION}`\n"
+        f"💾 DATA_DIR: `{DATA_DIR}`\n"
+    )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -253,7 +281,10 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["📋 *Modelos registradas:*"]
     for k, v in models.items():
-        lines.append(f"• *{v.get('name','')}* ({v.get('country','')}) — edad: {v.get('age','?')} — tags: {', '.join(v.get('tags',[]))}")
+        tags = ", ".join(v.get("tags", [])) if v.get("tags") else "-"
+        lines.append(
+            f"• *{v.get('name','')}* ({v.get('country','')}) — edad: {v.get('age','?')} — tags: {tags}\n  ID: `{k}`"
+        )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -274,15 +305,18 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Nombre de la modelo (ej: Aurora):")
     return S_MODEL_NAME
 
+
 async def register_model_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["model_name"] = update.message.text.strip()
     await update.message.reply_text("País (ej: Brasil, Perú, Alemania):")
     return S_COUNTRY
 
+
 async def register_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["country"] = update.message.text.strip()
     await update.message.reply_text("Edad (solo número, ej: 23):")
     return S_AGE
+
 
 async def register_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
@@ -291,12 +325,15 @@ async def register_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Tags/categorías separadas por coma (ej: latina, milf, teen, cosplay):")
     return S_TAGS
 
+
 async def register_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
     tags = [slugify(x) for x in raw.split(",") if x.strip()]
+
     name = context.user_data.get("model_name", "").strip()
     country = context.user_data.get("country", "").strip()
     age = context.user_data.get("age", "?")
+
     model_id = slugify(name) or f"model-{int(time.time())}"
 
     models = load_models()
@@ -325,12 +362,12 @@ async def plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Primero registra una modelo con /register")
         return ConversationHandler.END
 
-    # Mostrar lista rápida
     lines = ["Elige modelo (escribe el *ID*):"]
     for k, v in models.items():
         lines.append(f"• `{k}` = {v.get('name','')} ({v.get('country','')})")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     return S_MODEL_NAME
+
 
 async def plan_pick_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model_id = slugify(update.message.text.strip())
@@ -338,47 +375,51 @@ async def plan_pick_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if model_id not in models:
         await update.message.reply_text("❌ ID no válido. Copia/pega el ID exacto de la lista.")
         return S_MODEL_NAME
+
     context.user_data["plan_model_id"] = model_id
     await update.message.reply_text("Tipo de archivo: escribe `video` o `foto`")
     return S_TYPE
+
 
 async def plan_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = slugify(update.message.text.strip())
     if t not in ["video", "foto"]:
         await update.message.reply_text("Escribe solo: `video` o `foto`")
         return S_TYPE
+
     context.user_data["plan_type"] = t
     await update.message.reply_text("Categoría (ej: free, premium, teaser, cosplay, latina):")
     return S_CATEGORY
+
 
 async def plan_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat = slugify(update.message.text.strip()) or "general"
     model_id = context.user_data["plan_model_id"]
     t = context.user_data["plan_type"]
+
     models = load_models()
     m = models[model_id]
     date = now_yyyymmdd()
 
-    # Ruta final en Wasabi:
-    # country/model_id/type/category/YYYY-MM-DD/
     country = slugify(m.get("country", "unknown")) or "unknown"
     path = f"{country}/{model_id}/{t}/{cat}/{date}/"
 
-    # Guardamos registro (para que la web lo muestre)
     uploads = load_uploads()
-    uploads["items"].append({
-        "bucket": WASABI_BUCKET,
-        "region": WASABI_REGION,
-        "model_id": model_id,
-        "model_name": m.get("name", ""),
-        "country": m.get("country", ""),
-        "type": t,
-        "category": cat,
-        "date": date,
-        "title": f"{m.get('name','')} • {t} • {cat}",
-        "path": path,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-    })
+    uploads["items"].append(
+        {
+            "bucket": WASABI_BUCKET,
+            "region": WASABI_REGION,
+            "model_id": model_id,
+            "model_name": m.get("name", ""),
+            "country": m.get("country", ""),
+            "type": t,
+            "category": cat,
+            "date": date,
+            "title": f"{m.get('name','')} • {t} • {cat}",
+            "path": path,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+        }
+    )
     save_uploads(uploads)
 
     msg = (
@@ -389,9 +430,8 @@ async def plan_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Fecha: *{date}*\n\n"
         f"📦 Bucket: `{WASABI_BUCKET}`\n"
         f"🧭 Ruta: `{path}`\n\n"
-        "👉 Sube tus archivos a esa carpeta.\n"
-        "Luego la web ya lo listará como “nueva subida” (por ahora como registro).\n"
-        "\n"
+        "👉 Sube tus archivos a esa carpeta desde tu PC.\n"
+        "La web lo listará como “nueva subida” (por ahora como registro).\n\n"
         "Siguiente mejora: cuando subas el video, haremos *thumbnail automático* (preview) con ffmpeg."
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -417,12 +457,10 @@ def main():
     # Telegram Application (PTB v20.x)
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Handlers simples
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("models", cmd_models))
     application.add_handler(CommandHandler("last", cmd_last))
 
-    # Conversaciones
     register_conv = ConversationHandler(
         entry_points=[CommandHandler("register", register_start)],
         states={
@@ -450,7 +488,6 @@ def main():
     application.add_handler(plan_conv)
 
     logger.info("Telegram bot starting polling...")
-    # ✅ CLAVE: NO USAMOS UPDATER. Solo run_polling.
     application.run_polling(drop_pending_updates=True)
 
 
