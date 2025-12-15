@@ -32,49 +32,41 @@ logger = logging.getLogger("sensutv")
 # =========================
 # ENV VARS
 # =========================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # obligatorio
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
-BOT_PAY_LINK = os.getenv("BOT_PAY_LINK", "").strip()  # opcional
 
-# Persistencia (Render Disk recomendado: /var/data)
-# Si NO se puede escribir, caeremos a /tmp/data automáticamente.
-DATA_DIR_PREFERRED = os.getenv("DATA_DIR", "/var/data")
+# Link opcional al bot (ej: https://t.me/Quitin_bot?start=join)
+BOT_PAY_LINK = os.getenv("BOT_PAY_LINK", "").strip()
 
+# Wasabi info (solo informativo aquí)
+WASABI_BUCKET = os.getenv("WASABI_BUCKET", "sensutv-media").strip()
+WASABI_REGION = os.getenv("WASABI_REGION", "eu-central-2").strip()
+
+# Persistencia:
+# - Si tienes Render Disk montado, pon DATA_DIR=/var/data en Render
+# - Si no, usamos /tmp/data (NO persistente)
+PREFERRED_DATA_DIR = os.getenv("DATA_DIR", "/var/data").strip()
 
 def choose_data_dir(preferred: str) -> str:
-    """
-    Intenta usar preferred (idealmente /var/data con Render Disk).
-    Si falla por permisos o por cualquier motivo, usa /tmp/data (siempre escribible).
-    """
-    preferred = preferred.strip() or "/var/data"
-    fallback = "/tmp/data"
-
-    # 1) Probar preferred
+    # Intentar preferred
     try:
         os.makedirs(preferred, exist_ok=True)
         testfile = os.path.join(preferred, ".write_test")
         with open(testfile, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(testfile)
-        logger.info("✅ DATA_DIR usable: %s", preferred)
         return preferred
     except Exception as e:
-        logger.warning("⚠️ No se pudo usar DATA_DIR=%s (%s). Usando fallback %s", preferred, e, fallback)
+        logger.warning("⚠️ No se pudo usar DATA_DIR=%s (%s). Usando fallback /tmp/data", preferred, e)
+        fallback = "/tmp/data"
+        os.makedirs(fallback, exist_ok=True)
+        logger.info("✅ DATA_DIR fallback activo: %s", fallback)
+        return fallback
 
-    # 2) Fallback
-    os.makedirs(fallback, exist_ok=True)
-    logger.info("✅ DATA_DIR fallback activo: %s", fallback)
-    return fallback
-
-
-DATA_DIR = choose_data_dir(DATA_DIR_PREFERRED)
+DATA_DIR = choose_data_dir(PREFERRED_DATA_DIR)
 
 MODELS_FILE = os.path.join(DATA_DIR, "models.json")
 UPLOADS_FILE = os.path.join(DATA_DIR, "uploads.json")
-
-# Wasabi
-WASABI_BUCKET = os.getenv("WASABI_BUCKET", "sensutv-media")
-WASABI_REGION = os.getenv("WASABI_REGION", "eu-central-2")
 
 # =========================
 # HELPERS JSON
@@ -89,29 +81,23 @@ def _load_json(path: str, default: Any):
         logger.exception("Error leyendo %s: %s", path, e)
         return default
 
-
 def _save_json(path: str, data: Any):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-
 def load_models() -> Dict[str, Any]:
     return _load_json(MODELS_FILE, {})
-
 
 def save_models(models: Dict[str, Any]):
     _save_json(MODELS_FILE, models)
 
-
 def load_uploads() -> Dict[str, Any]:
     return _load_json(UPLOADS_FILE, {"items": []})
 
-
 def save_uploads(data: Dict[str, Any]):
     _save_json(UPLOADS_FILE, data)
-
 
 def slugify(s: str) -> str:
     s = s.strip().lower()
@@ -128,13 +114,11 @@ def slugify(s: str) -> str:
         res = res.replace("--", "-")
     return res.strip("-")
 
-
 def now_yyyymmdd() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
 
-
 # =========================
-# FLASK WEB (simple)
+# FLASK WEB
 # =========================
 app = Flask(__name__)
 
@@ -174,14 +158,11 @@ HOME_HTML = """<!doctype html>
         Link bot: <span class="mono">{{bot_pay_link}}</span>
       </div>
       {% endif %}
-      <div style="margin-top:12px" class="muted">
-        DATA_DIR activo: <span class="mono">{{data_dir}}</span>
-      </div>
     </div>
 
     <div class="card">
-      <h3>Últimas subidas</h3>
-      <div class="muted">Esto se alimenta de <span class="mono">uploads.json</span> (creado desde el bot).</div>
+      <h3>Últimas subidas (registro)</h3>
+      <div class="muted">Se alimenta de <span class="mono">uploads.json</span> (lo crea el bot con /plan).</div>
       <div class="grid" style="margin-top:12px">
         {% for it in items %}
         <div class="card" style="margin:0">
@@ -196,7 +177,10 @@ HOME_HTML = """<!doctype html>
 
     <div class="card">
       <h3>Estado</h3>
-      <div class="muted">Bucket: <b>{{bucket}}</b> • Region: <b>{{region}}</b></div>
+      <div class="muted">
+        Bucket: <b>{{bucket}}</b> • Region: <b>{{region}}</b><br/>
+        DATA_DIR: <span class="mono">{{data_dir}}</span>
+      </div>
       <div class="muted">API: <a style="color:#bfa7ff" href="/api/models">/api/models</a> • <a style="color:#bfa7ff" href="/api/uploads">/api/uploads</a></div>
     </div>
   </div>
@@ -204,11 +188,9 @@ HOME_HTML = """<!doctype html>
 </html>
 """
 
-
 @app.get("/healthz")
 def healthz():
     return "ok", 200
-
 
 @app.get("/")
 def home():
@@ -223,16 +205,13 @@ def home():
         data_dir=DATA_DIR,
     )
 
-
 @app.get("/api/models")
 def api_models():
     return jsonify(load_models())
 
-
 @app.get("/api/uploads")
 def api_uploads():
     return jsonify(load_uploads())
-
 
 @app.get("/feed")
 def feed():
@@ -240,24 +219,20 @@ def feed():
     data = load_uploads().get("items", [])
     return jsonify({"tier": tier, "items": list(reversed(data))})
 
-
 @app.get("/premium")
 def premium():
     if BOT_PAY_LINK:
         return jsonify({"ok": True, "next": BOT_PAY_LINK})
     return jsonify({"ok": False, "error": "BOT_PAY_LINK not set"}), 400
 
-
 def run_flask():
     logger.info("Starting Flask on port %s", PORT)
     app.run(host="0.0.0.0", port=PORT, debug=False)
 
-
 # =========================
-# TELEGRAM BOT (PTB v20.x)
+# TELEGRAM BOT (PTB v20.8)
 # =========================
 S_MODEL_NAME, S_COUNTRY, S_AGE, S_TAGS, S_TYPE, S_CATEGORY = range(6)
-
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -265,14 +240,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Comandos:\n"
         "• /register → registrar una modelo (nombre, país, edad, tags)\n"
         "• /models → lista de modelos\n"
-        "• /plan → te pregunto datos y te doy la *ruta exacta* para subir en Wasabi\n"
-        "• /last → últimas rutas creadas\n\n"
+        "• /plan → generar la *ruta exacta* para subir en Wasabi\n"
+        "• /last → últimas rutas generadas\n\n"
         f"📦 Bucket Wasabi: `{WASABI_BUCKET}`\n"
         f"🌍 Region: `{WASABI_REGION}`\n"
         f"💾 DATA_DIR: `{DATA_DIR}`\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
 
 async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     models = load_models()
@@ -280,13 +254,10 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Aún no hay modelos registradas. Usa /register")
         return
     lines = ["📋 *Modelos registradas:*"]
-    for k, v in models.items():
+    for _, v in models.items():
         tags = ", ".join(v.get("tags", [])) if v.get("tags") else "-"
-        lines.append(
-            f"• *{v.get('name','')}* ({v.get('country','')}) — edad: {v.get('age','?')} — tags: {tags}\n  ID: `{k}`"
-        )
+        lines.append(f"• *{v.get('name','')}* ({v.get('country','')}) — edad: {v.get('age','?')} — tags: {tags}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
 
 async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uploads = load_uploads().get("items", [])
@@ -299,32 +270,27 @@ async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {it.get('date','')} — *{it.get('model_name','')}* — `{it.get('path','')}`")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-
 # ---- REGISTER FLOW ----
 async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Nombre de la modelo (ej: Aurora):")
     return S_MODEL_NAME
-
 
 async def register_model_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["model_name"] = update.message.text.strip()
     await update.message.reply_text("País (ej: Brasil, Perú, Alemania):")
     return S_COUNTRY
 
-
 async def register_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["country"] = update.message.text.strip()
     await update.message.reply_text("Edad (solo número, ej: 23):")
     return S_AGE
 
-
 async def register_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     age = "".join([c for c in txt if c.isdigit()])
     context.user_data["age"] = age if age else "?"
-    await update.message.reply_text("Tags/categorías separadas por coma (ej: latina, milf, teen, cosplay):")
+    await update.message.reply_text("Tags separadas por coma (ej: latina, milf, cosplay):")
     return S_TAGS
-
 
 async def register_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
@@ -354,43 +320,38 @@ async def register_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-
-# ---- PLAN FLOW (ruta Wasabi) ----
+# ---- PLAN FLOW ----
 async def plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     models = load_models()
     if not models:
         await update.message.reply_text("Primero registra una modelo con /register")
         return ConversationHandler.END
 
-    lines = ["Elige modelo (escribe el *ID*):"]
+    lines = ["Elige modelo (escribe el *ID* exacto):"]
     for k, v in models.items():
         lines.append(f"• `{k}` = {v.get('name','')} ({v.get('country','')})")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     return S_MODEL_NAME
 
-
 async def plan_pick_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model_id = slugify(update.message.text.strip())
     models = load_models()
     if model_id not in models:
-        await update.message.reply_text("❌ ID no válido. Copia/pega el ID exacto de la lista.")
+        await update.message.reply_text("❌ ID no válido. Copia/pega el ID exacto.")
         return S_MODEL_NAME
 
     context.user_data["plan_model_id"] = model_id
     await update.message.reply_text("Tipo de archivo: escribe `video` o `foto`")
     return S_TYPE
 
-
 async def plan_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = slugify(update.message.text.strip())
     if t not in ["video", "foto"]:
         await update.message.reply_text("Escribe solo: `video` o `foto`")
         return S_TYPE
-
     context.user_data["plan_type"] = t
     await update.message.reply_text("Categoría (ej: free, premium, teaser, cosplay, latina):")
     return S_CATEGORY
-
 
 async def plan_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat = slugify(update.message.text.strip()) or "general"
@@ -405,21 +366,19 @@ async def plan_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = f"{country}/{model_id}/{t}/{cat}/{date}/"
 
     uploads = load_uploads()
-    uploads["items"].append(
-        {
-            "bucket": WASABI_BUCKET,
-            "region": WASABI_REGION,
-            "model_id": model_id,
-            "model_name": m.get("name", ""),
-            "country": m.get("country", ""),
-            "type": t,
-            "category": cat,
-            "date": date,
-            "title": f"{m.get('name','')} • {t} • {cat}",
-            "path": path,
-            "created_at": datetime.utcnow().isoformat() + "Z",
-        }
-    )
+    uploads["items"].append({
+        "bucket": WASABI_BUCKET,
+        "region": WASABI_REGION,
+        "model_id": model_id,
+        "model_name": m.get("name", ""),
+        "country": m.get("country", ""),
+        "type": t,
+        "category": cat,
+        "date": date,
+        "title": f"{m.get('name','')} • {t} • {cat}",
+        "path": path,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    })
     save_uploads(uploads)
 
     msg = (
@@ -430,31 +389,27 @@ async def plan_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Fecha: *{date}*\n\n"
         f"📦 Bucket: `{WASABI_BUCKET}`\n"
         f"🧭 Ruta: `{path}`\n\n"
-        "👉 Sube tus archivos a esa carpeta desde tu PC.\n"
-        "La web lo listará como “nueva subida” (por ahora como registro).\n\n"
-        "Siguiente mejora: cuando subas el video, haremos *thumbnail automático* (preview) con ffmpeg."
+        "👉 Sube tus archivos a esa carpeta en Wasabi.\n"
+        "La web ya lo listará como “nueva subida” (registro).\n"
+        "Siguiente mejora: *thumbnail automático* (preview) con ffmpeg cuando el upload sea automático."
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
     context.user_data.clear()
     return ConversationHandler.END
-
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Cancelado.")
     return ConversationHandler.END
 
-
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("Falta TELEGRAM_TOKEN en Render (Environment).")
 
     # Flask en thread separado
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    web_thread = threading.Thread(target=run_flask, daemon=True)
+    web_thread.start()
 
-    # Telegram Application (PTB v20.x)
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
@@ -489,7 +444,6 @@ def main():
 
     logger.info("Telegram bot starting polling...")
     application.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
