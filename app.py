@@ -1,312 +1,458 @@
 import os
-import re
 import json
 import time
 import logging
+import threading
 from datetime import datetime
-from io import BytesIO
+from typing import Dict, Any, Optional
 
-from flask import Flask
+from flask import Flask, jsonify, render_template_string, request
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-
-import boto3
-
-# ---------------- LOG ----------------
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-log = logging.getLogger("sensutv-uploader")
-
-# ---------------- ENV ----------------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-
-WASABI_ACCESS_KEY = os.environ.get("WASABI_ACCESS_KEY")
-WASABI_SECRET_KEY = os.environ.get("WASABI_SECRET_KEY")
-WASABI_BUCKET = os.environ.get("WASABI_BUCKET", "sensutv-media")
-WASABI_REGION = os.environ.get("WASABI_REGION", "eu-central-2")
-WASABI_ENDPOINT = os.environ.get("WASABI_ENDPOINT", "https://s3.eu-central-2.wasabisys.com")
-
-# Admins: IDs separados por coma (ej: "12345,67890")
-ADMIN_USER_IDS = set()
-if os.environ.get("ADMIN_USER_IDS"):
-    ADMIN_USER_IDS = {int(x.strip()) for x in os.environ["ADMIN_USER_IDS"].split(",") if x.strip().isdigit()}
-
-# ---------------- S3 Client ----------------
-s3 = boto3.client(
-    "s3",
-    region_name=WASABI_REGION,
-    endpoint_url=WASABI_ENDPOINT,
-    aws_access_key_id=WASABI_ACCESS_KEY,
-    aws_secret_access_key=WASABI_SECRET_KEY,
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
-# ---------------- SIMPLE STATE (RAM) ----------------
-# En producción luego lo persistimos (manifest/profile en Wasabi).
-SESSION = {}  # user_id -> dict
+# =========================
+# LOGGING
+# =========================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+)
+logger = logging.getLogger("sensutv")
 
-MANIFEST_KEY = "data/manifest.json"  # la webapp leerá esto
+# =========================
+# ENV VARS
+# =========================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # obligatorio
+PORT = int(os.getenv("PORT", "10000"))
+BOT_PAY_LINK = os.getenv("BOT_PAY_LINK", "").strip()  # opcional (link t.me/tuBot?start=join)
 
-# ---------------- HELPERS ----------------
-def is_admin(user_id: int) -> bool:
-    return (not ADMIN_USER_IDS) or (user_id in ADMIN_USER_IDS)
+# Persistencia (Render Disk recomendado: /var/data)
+DATA_DIR = os.getenv("DATA_DIR", "/var/data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-def slugify(text: str) -> str:
-    text = text.strip().lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    return text.strip("-")
+MODELS_FILE = os.path.join(DATA_DIR, "models.json")
+UPLOADS_FILE = os.path.join(DATA_DIR, "uploads.json")
 
-def today_path() -> str:
-    now = datetime.utcnow()
-    return now.strftime("%Y/%m/%d")
+# Para tu organización en Wasabi (bucket ya creado: sensutv-media)
+WASABI_BUCKET = os.getenv("WASABI_BUCKET", "sensutv-media")
+# Región informativa (no se usa para subir, solo para mostrar)
+WASABI_REGION = os.getenv("WASABI_REGION", "eu-central-2")
 
-def s3_put_bytes(key: str, data: bytes, content_type: str):
-    s3.put_object(
-        Bucket=WASABI_BUCKET,
-        Key=key,
-        Body=data,
-        ContentType=content_type,
-    )
-
-def s3_get_json_or_default(key: str, default):
+# =========================
+# HELPERS JSON
+# =========================
+def _load_json(path: str, default: Any):
     try:
-        obj = s3.get_object(Bucket=WASABI_BUCKET, Key=key)
-        raw = obj["Body"].read()
-        return json.loads(raw.decode("utf-8"))
-    except Exception:
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.exception("Error leyendo %s: %s", path, e)
         return default
 
-def s3_put_json(key: str, payload):
-    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    s3_put_bytes(key, data, "application/json")
 
-def ensure_manifest():
-    m = s3_get_json_or_default(MANIFEST_KEY, {"models": {}, "items": []})
-    if "models" not in m: m["models"] = {}
-    if "items" not in m: m["items"] = []
-    return m
+def _save_json(path: str, data: Any):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
-def ensure_model_profile(model_slug: str, profile: dict):
-    key = f"models/{model_slug}/profile.json"
-    existing = s3_get_json_or_default(key, None)
-    if existing is None:
-        s3_put_json(key, profile)
 
-# ---------------- BOT COMMANDS ----------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ No autorizado.")
-        return
+def load_models() -> Dict[str, Any]:
+    return _load_json(MODELS_FILE, {})
 
-    await update.message.reply_text(
-        "✅ SensuTV Uploader listo.\n\n"
-        "1) /newmodel para registrar modelo\n"
-        "2) /setmodel <nombre> para seleccionar modelo\n"
-        "3) Envíame foto o video y lo subo a Wasabi\n\n"
-        "Tip: /whoami para ver tu ID"
-    )
 
-async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    await update.message.reply_text(f"👤 Tu ID: {u.id}\nUsername: @{u.username}")
+def save_models(models: Dict[str, Any]):
+    _save_json(MODELS_FILE, models)
 
-async def cmd_newmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ No autorizado.")
-        return
-    SESSION[update.effective_user.id] = {"step": "model_name"}
-    await update.message.reply_text("🧩 Nombre de la modelo? (ej: Aurora)")
 
-async def cmd_setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ No autorizado.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usa: /setmodel Aurora")
-        return
-    name = " ".join(context.args).strip()
-    model_slug = slugify(name)
-    SESSION.setdefault(update.effective_user.id, {})
-    SESSION[update.effective_user.id]["model_slug"] = model_slug
-    SESSION[update.effective_user.id]["model_name"] = name
-    await update.message.reply_text(f"✅ Modelo activo: {name} ({model_slug})\nAhora envíame un video o foto.")
+def load_uploads() -> Dict[str, Any]:
+    return _load_json(UPLOADS_FILE, {"items": []})
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
 
-    uid = update.effective_user.id
-    st = SESSION.get(uid, {})
-    step = st.get("step")
+def save_uploads(data: Dict[str, Any]):
+    _save_json(UPLOADS_FILE, data)
 
-    if step == "model_name":
-        name = update.message.text.strip()
-        st["model_name"] = name
-        st["model_slug"] = slugify(name)
-        st["step"] = "model_age"
-        SESSION[uid] = st
-        await update.message.reply_text("🎂 Edad? (solo número, ej 23)")
-        return
 
-    if step == "model_age":
-        age_txt = update.message.text.strip()
-        if not age_txt.isdigit():
-            await update.message.reply_text("Pon solo número (ej 23).")
-            return
-        st["age"] = int(age_txt)
-        st["step"] = "model_country"
-        await update.message.reply_text("🌍 País? (ej: Brasil)")
-        return
+def slugify(s: str) -> str:
+    s = s.strip().lower()
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+    out = []
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+        elif ch in [" ", ".", "/", "\\", "|", ":", ";", ",", "+", "&"]:
+            out.append("-")
+        elif ch in ["_", "-"]:
+            out.append(ch)
+        # otros caracteres se eliminan
+    res = "".join(out)
+    while "--" in res:
+        res = res.replace("--", "-")
+    return res.strip("-")
 
-    if step == "model_country":
-        st["country"] = update.message.text.strip()
-        st["step"] = "model_tags"
-        await update.message.reply_text("🏷️ Categorías (separadas por coma). Ej: latina, milf, cosplay")
-        return
 
-    if step == "model_tags":
-        tags = [x.strip() for x in update.message.text.split(",") if x.strip()]
-        st["tags"] = tags
-        st["step"] = None
+def now_yyyymmdd() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
 
-        # Guardar profile
-        model_slug = st["model_slug"]
-        profile = {
-            "name": st["model_name"],
-            "slug": model_slug,
-            "age": st.get("age"),
-            "country": st.get("country"),
-            "tags": st.get("tags", []),
-            "updated_at": datetime.utcnow().isoformat() + "Z",
-        }
-        ensure_model_profile(model_slug, profile)
 
-        # Registrar en manifest
-        m = ensure_manifest()
-        m["models"][model_slug] = profile
-        s3_put_json(MANIFEST_KEY, m)
-
-        await update.message.reply_text(
-            f"✅ Modelo creada y guardada:\n"
-            f"- {profile['name']} ({profile['slug']})\n"
-            f"- {profile['country']} | {profile['age']}\n"
-            f"- tags: {', '.join(profile['tags'])}\n\n"
-            f"Ahora: /setmodel {profile['name']} y envíame media."
-        )
-        SESSION[uid] = st
-        return
-
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
-    uid = update.effective_user.id
-    st = SESSION.get(uid, {})
-    model_slug = st.get("model_slug")
-    model_name = st.get("model_name")
-
-    if not model_slug:
-        await update.message.reply_text("⚠️ Primero selecciona modelo: /setmodel Aurora\nO crea: /newmodel")
-        return
-
-    # Determinar archivo
-    file = None
-    filename = None
-    content_type = "application/octet-stream"
-    thumb_file = None
-    thumb_ct = None
-
-    if update.message.photo:
-        # mejor calidad al final
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        filename = f"photo_{int(time.time())}.jpg"
-        content_type = "image/jpeg"
-
-    elif update.message.video:
-        v = update.message.video
-        file = await context.bot.get_file(v.file_id)
-        filename = v.file_name or f"video_{int(time.time())}.mp4"
-        content_type = v.mime_type or "video/mp4"
-
-        # Thumbnail (Telegram a veces lo trae)
-        if v.thumbnail:
-            thumb_file = await context.bot.get_file(v.thumbnail.file_id)
-            thumb_ct = "image/jpeg"
-
-    else:
-        await update.message.reply_text("Envíame una foto o video.")
-        return
-
-    # Descargar bytes
-    b = BytesIO()
-    await file.download_to_memory(out=b)
-    data = b.getvalue()
-
-    date_path = today_path()
-    key_media = f"models/{model_slug}/media/{date_path}/{filename}"
-
-    # Subir media
-    s3_put_bytes(key_media, data, content_type)
-
-    # Subir thumb si existe (para videos)
-    key_thumb = None
-    if thumb_file:
-        tb = BytesIO()
-        await thumb_file.download_to_memory(out=tb)
-        tdata = tb.getvalue()
-        key_thumb = f"models/{model_slug}/thumbs/{date_path}/{slugify(filename)}.jpg"
-        s3_put_bytes(key_thumb, tdata, "image/jpeg")
-
-    # Actualizar manifest (un item nuevo)
-    m = ensure_manifest()
-    item = {
-        "id": f"{model_slug}-{int(time.time())}",
-        "model": model_slug,
-        "model_name": model_name,
-        "type": "video" if "video" in content_type else "photo",
-        "key": key_media,
-        "thumb_key": key_thumb,
-        "content_type": content_type,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-    }
-    m["items"].insert(0, item)  # lo más nuevo arriba
-    s3_put_json(MANIFEST_KEY, m)
-
-    await update.message.reply_text(
-        "✅ Subido a Wasabi!\n"
-        f"Modelo: {model_name}\n"
-        f"Archivo: {filename}\n"
-        f"Ruta: {key_media}\n"
-        + (f"Thumb: {key_thumb}\n" if key_thumb else "")
-        + "\n👉 La webapp lo podrá detectar vía manifest."
-    )
-
-# ---------------- FLASK KEEPALIVE ----------------
+# =========================
+# FLASK WEB (simple)
+# =========================
 app = Flask(__name__)
+
+HOME_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>SensuTV</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body{font-family:system-ui,Arial;margin:0;background:#0b0b10;color:#fff}
+    .wrap{max-width:900px;margin:0 auto;padding:24px}
+    .card{background:#141421;border:1px solid #2a2a3a;border-radius:16px;padding:18px;margin:14px 0}
+    .btn{display:inline-block;padding:12px 16px;border-radius:14px;text-decoration:none;margin-right:10px}
+    .btn1{background:#6d28d9;color:#fff}
+    .btn2{background:#ff3d8a;color:#fff}
+    .muted{color:#b9b9c9}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+    .pill{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid #2a2a3a;color:#cfcfe6;font-size:12px}
+    .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#cfcfe6}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>SensuTV</h2>
+    <div class="muted">Webapp en Render + bot en Telegram + media en Wasabi.</div>
+
+    <div class="card">
+      <h3>Entra... y mira lo que otros no ven 🔥</h3>
+      <div class="muted">Previews gratis. Si quieres lo completo... desbloquea Premium.</div>
+      <div style="margin-top:14px">
+        <a class="btn btn1" href="/feed?tier=free">Ver previews gratis</a>
+        <a class="btn btn2" href="/premium">Desbloquear Premium</a>
+      </div>
+      {% if bot_pay_link %}
+      <div style="margin-top:12px" class="muted">
+        Link bot: <span class="mono">{{bot_pay_link}}</span>
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h3>Últimas subidas</h3>
+      <div class="muted">Esto se alimenta de <span class="mono">uploads.json</span> (que creamos desde el bot).</div>
+      <div class="grid" style="margin-top:12px">
+        {% for it in items %}
+        <div class="card" style="margin:0">
+          <div class="pill">{{it.get("model_name","")}} • {{it.get("country","")}}</div>
+          <div style="margin-top:10px"><b>{{it.get("title","Nuevo contenido")}}</b></div>
+          <div class="muted" style="margin-top:6px">{{it.get("type","")}} • {{it.get("date","")}}</div>
+          <div class="mono" style="margin-top:10px">wasabi://{{it.get("bucket","")}}/{{it.get("path","")}}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Estado</h3>
+      <div class="muted">Bucket: <b>{{bucket}}</b> • Region: <b>{{region}}</b></div>
+      <div class="muted">API: <a style="color:#bfa7ff" href="/api/models">/api/models</a> • <a style="color:#bfa7ff" href="/api/uploads">/api/uploads</a></div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
 
 @app.get("/")
 def home():
-    return "OK - SensuTV Uploader Bot"
+    uploads = load_uploads().get("items", [])
+    items = list(reversed(uploads))[:6]
+    return render_template_string(
+        HOME_HTML,
+        items=items,
+        bot_pay_link=BOT_PAY_LINK,
+        bucket=WASABI_BUCKET,
+        region=WASABI_REGION,
+    )
+
+@app.get("/api/models")
+def api_models():
+    return jsonify(load_models())
+
+@app.get("/api/uploads")
+def api_uploads():
+    return jsonify(load_uploads())
+
+@app.get("/feed")
+def feed():
+    tier = request.args.get("tier", "free")
+    data = load_uploads().get("items", [])
+    # por ahora mostramos todo, luego filtramos free/premium
+    return jsonify({"tier": tier, "items": list(reversed(data))})
+
+@app.get("/premium")
+def premium():
+    # Aquí después conectamos Stripe o redirección a bot
+    if BOT_PAY_LINK:
+        return jsonify({"ok": True, "next": BOT_PAY_LINK})
+    return jsonify({"ok": False, "error": "BOT_PAY_LINK not set"}), 400
+
+
+def run_flask():
+    logger.info("Starting Flask on port %s", PORT)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
+# =========================
+# TELEGRAM BOT (PTB v20.x)
+# =========================
+
+# Conversation states
+S_MODEL_NAME, S_COUNTRY, S_AGE, S_TAGS, S_TYPE, S_CATEGORY = range(6)
+
+def is_admin(update: Update) -> bool:
+    # Por simplicidad: el dueño eres tú. Luego podemos restringir por user_id.
+    return True
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "✅ *SensuTV Bot activo*\n\n"
+        "Comandos:\n"
+        "• /register → registrar una modelo (nombre, país, edad, tags)\n"
+        "• /models → lista de modelos\n"
+        "• /plan → te pregunto datos y te doy la *ruta exacta* para subir en Wasabi\n"
+        "• /last → últimas rutas creadas\n\n"
+        "📦 Bucket Wasabi: `{}`\n"
+        "🌍 Region: `{}`\n"
+    ).format(WASABI_BUCKET, WASABI_REGION)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    models = load_models()
+    if not models:
+        await update.message.reply_text("Aún no hay modelos registradas. Usa /register")
+        return
+    lines = ["📋 *Modelos registradas:*"]
+    for k, v in models.items():
+        lines.append(f"• *{v.get('name','')}* ({v.get('country','')}) — edad: {v.get('age','?')} — tags: {', '.join(v.get('tags',[]))}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uploads = load_uploads().get("items", [])
+    if not uploads:
+        await update.message.reply_text("No hay registros aún. Usa /plan para generar rutas.")
+        return
+    last = list(reversed(uploads))[:10]
+    lines = ["🕒 *Últimas rutas generadas:*"]
+    for it in last:
+        lines.append(f"• {it.get('date','')} — *{it.get('model_name','')}* — `{it.get('path','')}`")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+# ---- REGISTER FLOW ----
+async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Nombre de la modelo (ej: Aurora):")
+    return S_MODEL_NAME
+
+async def register_model_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["model_name"] = update.message.text.strip()
+    await update.message.reply_text("País (ej: Brasil, Perú, Alemania):")
+    return S_COUNTRY
+
+async def register_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["country"] = update.message.text.strip()
+    await update.message.reply_text("Edad (solo número, ej: 23):")
+    return S_AGE
+
+async def register_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    age = "".join([c for c in txt if c.isdigit()])
+    context.user_data["age"] = age if age else "?"
+    await update.message.reply_text("Tags/categorías separadas por coma (ej: latina, milf, teen, cosplay):")
+    return S_TAGS
+
+async def register_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    tags = [slugify(x) for x in raw.split(",") if x.strip()]
+    name = context.user_data.get("model_name", "").strip()
+    country = context.user_data.get("country", "").strip()
+    age = context.user_data.get("age", "?")
+    model_id = slugify(name) or f"model-{int(time.time())}"
+
+    models = load_models()
+    models[model_id] = {
+        "id": model_id,
+        "name": name,
+        "country": country,
+        "age": age,
+        "tags": tags,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+    save_models(models)
+
+    await update.message.reply_text(
+        f"✅ Registrada: *{name}*\nID: `{model_id}`\nPaís: {country}\nEdad: {age}\nTags: {', '.join(tags) if tags else '-'}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ---- PLAN FLOW (ruta Wasabi) ----
+async def plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    models = load_models()
+    if not models:
+        await update.message.reply_text("Primero registra una modelo con /register")
+        return ConversationHandler.END
+
+    # Mostrar lista rápida
+    lines = ["Elige modelo (escribe el *ID*):"]
+    for k, v in models.items():
+        lines.append(f"• `{k}` = {v.get('name','')} ({v.get('country','')})")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    return S_MODEL_NAME
+
+async def plan_pick_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    model_id = slugify(update.message.text.strip())
+    models = load_models()
+    if model_id not in models:
+        await update.message.reply_text("❌ ID no válido. Copia/pega el ID exacto de la lista.")
+        return S_MODEL_NAME
+    context.user_data["plan_model_id"] = model_id
+    await update.message.reply_text("Tipo de archivo: escribe `video` o `foto`")
+    return S_TYPE
+
+async def plan_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = slugify(update.message.text.strip())
+    if t not in ["video", "foto"]:
+        await update.message.reply_text("Escribe solo: `video` o `foto`")
+        return S_TYPE
+    context.user_data["plan_type"] = t
+    await update.message.reply_text("Categoría (ej: free, premium, teaser, cosplay, latina):")
+    return S_CATEGORY
+
+async def plan_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat = slugify(update.message.text.strip()) or "general"
+    model_id = context.user_data["plan_model_id"]
+    t = context.user_data["plan_type"]
+    models = load_models()
+    m = models[model_id]
+    date = now_yyyymmdd()
+
+    # Ruta final en Wasabi:
+    # country/model_id/type/category/YYYY-MM-DD/
+    country = slugify(m.get("country", "unknown")) or "unknown"
+    path = f"{country}/{model_id}/{t}/{cat}/{date}/"
+
+    # Guardamos registro (para que la web lo muestre)
+    uploads = load_uploads()
+    uploads["items"].append({
+        "bucket": WASABI_BUCKET,
+        "region": WASABI_REGION,
+        "model_id": model_id,
+        "model_name": m.get("name", ""),
+        "country": m.get("country", ""),
+        "type": t,
+        "category": cat,
+        "date": date,
+        "title": f"{m.get('name','')} • {t} • {cat}",
+        "path": path,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    })
+    save_uploads(uploads)
+
+    msg = (
+        "✅ *Ruta generada*\n\n"
+        f"Modelo: *{m.get('name','')}*\n"
+        f"Tipo: *{t}*\n"
+        f"Categoría: *{cat}*\n"
+        f"Fecha: *{date}*\n\n"
+        f"📦 Bucket: `{WASABI_BUCKET}`\n"
+        f"🧭 Ruta: `{path}`\n\n"
+        "👉 Sube tus archivos a esa carpeta.\n"
+        "Luego la web ya lo listará como “nueva subida” (por ahora como registro).\n"
+        "\n"
+        "Siguiente mejora: cuando subas el video, haremos *thumbnail automático* (preview) con ffmpeg."
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Cancelado.")
+    return ConversationHandler.END
+
 
 def main():
     if not TELEGRAM_TOKEN:
-        raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno.")
-    if not WASABI_ACCESS_KEY or not WASABI_SECRET_KEY:
-        raise RuntimeError("Faltan WASABI_ACCESS_KEY / WASABI_SECRET_KEY.")
+        raise RuntimeError("Falta TELEGRAM_TOKEN en Render (Environment).")
 
+    # Flask en thread separado
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Telegram Application (PTB v20.x)
     application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("whoami", cmd_whoami))
-    application.add_handler(CommandHandler("newmodel", cmd_newmodel))
-    application.add_handler(CommandHandler("setmodel", cmd_setmodel))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media))
 
-    # polling
+    # Handlers simples
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("models", cmd_models))
+    application.add_handler(CommandHandler("last", cmd_last))
+
+    # Conversaciones
+    register_conv = ConversationHandler(
+        entry_points=[CommandHandler("register", register_start)],
+        states={
+            S_MODEL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_model_name)],
+            S_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_country)],
+            S_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_age)],
+            S_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_tags)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    plan_conv = ConversationHandler(
+        entry_points=[CommandHandler("plan", plan_start)],
+        states={
+            S_MODEL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, plan_pick_model)],
+            S_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, plan_type)],
+            S_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, plan_category)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    application.add_handler(register_conv)
+    application.add_handler(plan_conv)
+
+    logger.info("Telegram bot starting polling...")
+    # ✅ CLAVE: NO USAMOS UPDATER. Solo run_polling.
     application.run_polling(drop_pending_updates=True)
 
+
 if __name__ == "__main__":
-    # Render necesita puerto abierto (keep-alive)
-    port = int(os.environ.get("PORT", "10000"))
-    from threading import Thread
-    Thread(target=lambda: app.run(host="0.0.0.0", port=port), daemon=True).start()
     main()
